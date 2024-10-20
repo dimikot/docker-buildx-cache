@@ -1,0 +1,24 @@
+{
+  "name": "docker-buildx-cache",
+  "description": "Improved version of \"docker buildx du\" and \"docker buildx prune\"",
+  "version": "1.0.12",
+  "license": "MIT",
+  "keywords": [
+    "docker",
+    "buildx",
+    "prune",
+    "du"
+  ],
+  "bin": {
+    "docker-buildx-cache": "./docker-buildx-cache"
+  },
+  "scripts": {
+    "docs": "internal/docs.sh",
+    "clean": "rm -rf node_modules",
+    "deploy": "internal/docs.sh && npm publish --access=public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/dimikot/docker-buildx-cache"
+  }
+}

@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse
+import dataclasses
+import datetime
+import os
+import re
+import shlex
+import subprocess
+import sys
+import textwrap
+import time
+from collections import OrderedDict
+
+HEADER = ["USAGES", "", "ID", "", "PARENT", "SIZE", "LAST USED", "DESCRIPTION", ""]
+COLOR_WHITE = "\033[1;37m"
+COLOR_DARK_GRAY = "\033[38;2;160;160;160m"
+COLOR_END = "\033[0m"
+COLORS = [
+    "\033[95m",  # magenta
+    "\033[94m",  # blue
+    "\033[92m",  # green
+    "\033[93m",  # yellow
+    "\033[91m",  # red
+]
+DATE_FORMATS = [
+    "%a, %d %b %Y %H:%M:%S %z",  # Sat, 19 Oct 2024 20:17:25 -0700
+    "%a %b %d %H:%M:%S %Z %Y",  # Sat Oct 19 20:17:29 PDT 2024
+]
+
+
+#
+# Tool entry point.
+#
+def main():
+    parser = argparse.ArgumentParser(
+        description="""
+            When "du" action is run, calls "docker builds du --verbose" under
+            the hood and represents its output in a "forest" form. Cache layers
+            are displayed with corresponding nesting. Colors are used to
+            highlight layers with common parents.
+
+            When "prune" action is run, calls "docker buildx prune", then
+            analyzes its output, the output of du, and additionally calls
+            "docker buildx prune" again to prune even more layers. If --verbose
+            is used, prints "before" and "after" forests. This action exists to
+            work-around the default pruning mis-behavior explained here:
+            https://github.com/moby/buildkit/issues/5436
+        """,
+        formatter_class=ParagraphFormatter,
+    )
+    parser.add_argument(
+        "action",
+        type=str,
+        choices=["du", "prune"],
+        help="action to perform",
+    )
+    parser.add_argument(
+        "--builder",
+        type=str,
+        required=False,
+        help='builder name passed to the underlying "docker buildx" commands',
+    )
+    parser.add_argument(
+        "--description-len",
+        type=int,
+        required=False,
+        default=70,
+        help="shorten the description of each layer to this length",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="print detailed colorful output",
+    )
+    parser.add_argument(
+        "--until",
+        type=str,
+        required=False,
+        help='required for "prune" action; holds numeric timestamp, ISO date timestamp or duration string; only the layers older than this timestamp will be pruned',
+    )
+    args = parser.parse_intermixed_args()
+
+    action = str(args.action)
+    builder = str(args.builder or "") or None
+    description_len = int(args.description_len)
+    verbose = bool(args.verbose)
+    until: str | int = 0
+    if action == "prune":
+        if not args.until:
+            print("error: --until is required for prune action", file=sys.stderr)
+            sys.exit(1)
+        until = parse_until(until_str=str(args.until))
+
+    if args.action == "du":
+        action_du(
+            builder=builder,
+            description_len=description_len,
+        )
+    elif args.action == "prune":
+        action_prune(
+            builder=builder,
+            description_len=description_len,
+            verbose=verbose,
+            until=until,
+        )
+
+
+#
+# Runs "du" action.
+#
+def action_du(
+    *,
+    builder: str | None,
+    description_len: int,
+) -> None:
+    output = docker_buildx_du_verbose_output(builder=builder)
+    forest = parse_output(output=output)
+    print_forest(
+        forest=forest,
+        description_len=description_len,
+        only_total=False,
+    )
+
+
+#
+# Runs "prune" action.
+#
+def action_prune(
+    *,
+    builder: str | None,
+    description_len: int,
+    verbose: bool,
+    until: str | int,
+) -> None:
+    output = docker_buildx_du_verbose_output(builder=builder)
+    forest_before = parse_output(output=output)
+    print_forest(
+        forest=forest_before,
+        description_len=description_len,
+        only_total=not verbose,
+    )
+
+    output, debug_prune = docker_buildx_prune_until_output(builder=builder, until=until)
+    forest_pruned_1 = parse_output(output=output)
+    print_forest(
+        forest=forest_pruned_1,
+        description_len=description_len,
+        only_total=False,
+        total_msg="TOTAL PRUNED",
+    )
+
+    extra_prunable_ids = build_extra_prunable_ids(
+        forest=forest_before,
+        ids_pruned=[*forest_pruned_1.layers.keys()],
+    )
+    if extra_prunable_ids:
+        output = docker_buildx_prune_ids_output(
+            builder=builder,
+            ids=extra_prunable_ids,
+            dry_run=debug_prune,
+        )
+        forest_pruned_2 = parse_output(output=output)
+        print_forest(
+            forest=forest_pruned_2,
+            description_len=description_len,
+            only_total=False,
+            total_msg="TOTAL PRUNED",
+        )
+
+    if forest_pruned_1.layers:
+        output = docker_buildx_du_verbose_output(builder=builder)
+        forest_after = parse_output(output=output)
+        print_forest(
+            forest=forest_after,
+            description_len=description_len,
+            only_total=not verbose,
+        )
+
+
+#
+# A wrapper for "docker buildx du --verbose" command.
+#
+def docker_buildx_du_verbose_output(*, builder: str | None) -> str:
+    return check_output(
+        cmd=[
+            "docker",
+            "buildx",
+            "du",
+            "--verbose",
+            *([f"--builder={builder}"] if builder else []),
+        ],
+    )
+
+
+#
+# A wrapper for "docker buildx prune --filter=until=... --verbose" command.
+#
+def docker_buildx_prune_until_output(
+    *,
+    builder: str | None,
+    until: str | int,
+) -> tuple[str, bool]:
+    debug_prune = False
+    if isinstance(until, str) and re.match(r"^[0-9a-z]{25}$", until):
+        # A debugging hack: if a layer id is passed in until, then we only prune
+        # that layer and let the tool figure out the rest.
+        filter = f"id={until}"
+        debug_prune = True
+    else:
+        filter = f"until={build_until_relative(until)}"
+    output = check_output(
+        cmd=[
+            "docker",
+            "buildx",
+            "prune",
+            "--verbose",
+            "--force",
+            f"--filter={filter}",
+            *([f"--builder={builder}"] if builder else []),
+        ],
+    )
+    return output, debug_prune
+
+
+#
+# A wrapper for "docker buildx prune --filter=id=... --verbose" command.
+#
+def docker_buildx_prune_ids_output(
+    *,
+    builder: str | None,
+    ids: list[str],
+    dry_run: bool,
+) -> str:
+    return check_output(
+        cmd=[
+            "docker",
+            "buildx",
+            "prune",
+            "--verbose",
+            "--force",
+            f"--filter=id={'|'.join(ids)}",
+            *([f"--builder={builder}"] if builder else []),
+        ],
+        dry_run=dry_run,
+    )
+
+
+#
+# Parses strings like:
+#
+# - "123456789": Unix timestamp printed by "date +%s"
+# - "Sat Oct 19 20:17:29 PDT 2024": a string returned by "date" or "date -R"
+# - "24h" or "2h30m", a duration string with allowable units of (h)ours,
+#   (m)inutes and (s)econds.
+#
+def parse_until(*, until_str: str) -> str | int:
+    if until_str.isdigit():
+        return int(until_str)
+    for fmt in DATE_FORMATS:
+        try:
+            parsed = datetime.datetime.strptime(until_str, fmt)
+            return int(parsed.timestamp())
+        except ValueError:
+            continue
+    return until_str
+
+
+#
+# Returns a string like "1234s". If until is a string already, it's implied that
+# it's already in such format.
+#
+def build_until_relative(until: str | int) -> str:
+    if isinstance(until, str):
+        return until
+    return f"{int(time.time() - until)}s"
+
+
+#
+# Parses output of "docker buildx du --verbose" or "prune --verbose" commands.
+#
+def parse_output(
+    *,
+    output: str,
+) -> Forest:
+    layers = OrderedDict[str, Layer]()
+    total = ""
+    layer = Layer()
+    for line in output.strip().split("\n"):
+        line = line.strip()
+        m = re.match(r"^([^:]+):\s+(.+)", line)
+        if not m:
+            if layer.id:
+                layers[layer.id] = layer
+            layer = Layer()
+            continue
+        key, value = m.groups()[0].lower(), m.groups()[1]
+        if key == "total":
+            total = value
+            break
+        elif key == "id":
+            layer.id = value
+        elif key == "parent":
+            layer.parent = value
+        elif key == "size":
+            layer.size = value
+        elif key == "last used":
+            layer.last_used = value
+        elif key == "created at":
+            layer.created_at = value
+        elif key == "usage count":
+            layer.usage_count = int(value)
+        elif key == "description":
+            layer.description = value
+
+    layers = OrderedDict(sorted(layers.items(), key=lambda item: item[1].created_at))
+
+    for layer in layers.values():
+        if layer.parent in layers:
+            layer.is_root = False
+        if layer.parent in layers:
+            layers[layer.parent].is_leaf = False
+
+    return Forest(layers=layers, total=total)
+
+
+#
+# Returns additional ids subject for pruning.
+#
+def build_extra_prunable_ids(*, forest: Forest, ids_pruned: list[str]) -> list[str]:
+    # Initially, all layers are non-prunable.
+    prunable_ids = OrderedDict[str, None]()
+    # Mark chain to root as prunable for chains which include ids_pruned.
+    for id in ids_pruned:
+        while id in forest.layers:
+            prunable_ids[id] = None
+            id = forest.layers[id].parent
+    # Mark chains to root starting from each leaf as non-prunable if that leaf
+    # is not in ids_pruned.
+    for leaf in (leaf for leaf in forest.layers.values() if leaf.is_leaf):
+        if not leaf.id in ids_pruned:
+            id = leaf.id
+            while id in forest.layers:
+                prunable_ids.pop(id, None)
+                id = forest.layers[id].parent
+    # Remove originally pruned ids too.
+    for id in ids_pruned:
+        prunable_ids.pop(id, None)
+    return [*prunable_ids.keys()]
+
+
+#
+# Prints the entire forest of layers with total stats.
+#
+def print_forest(
+    *,
+    forest: Forest,
+    description_len: int,
+    only_total: bool,
+    total_msg: str = "TOTAL",
+) -> None:
+    fmt = "{:<8} {}{:<30} {}{:<30} {:<12} {:<26} {:<" + str(description_len) + "}{}"
+    if not only_total:
+        roots = [layer for layer in forest.layers.values() if layer.is_root]
+        if roots:
+            print(COLOR_WHITE + fmt.format(*HEADER) + COLOR_END)
+            for layer in roots:
+                print_with_children(
+                    fmt=fmt,
+                    layer=layer,
+                    description_len=description_len,
+                    layers=forest.layers,
+                    level=0,
+                    color="",
+                )
+    print(f"{total_msg}: {forest.total or '0B'}")
+
+
+#
+# Recursively prints a subtree started from the given layer.
+#
+def print_with_children(
+    *,
+    fmt: str,
+    layer: Layer,
+    description_len: int,
+    layers: OrderedDict[str, Layer],
+    level: int,
+    color: str,
+) -> None:
+    description = layer.description
+    description = re.sub(r"[ \t]+", " ", description)
+    description = re.sub(r"mount / from exec /bin/sh -c ", "", description)
+    description = re.sub(r"true && ", "", description)
+    if len(description) > description_len:
+        description = description[:description_len] + "..."
+    c_start = color
+    c_end = COLOR_END if color else ""
+    print(
+        fmt.format(
+            f"  {layer.usage_count}",
+            "  " * level,
+            layer.id,
+            c_start,
+            layer.parent or "—",
+            layer.size or "",
+            layer.last_used or "",
+            description,
+            c_end,
+        )
+    )
+    children = [child for child in layers.values() if child.parent == layer.id]
+    if len(children) > 1:
+        color = COLORS.pop(0)
+        COLORS.append(color)
+    else:
+        color = ""
+    for child in children:
+        print_with_children(
+            fmt=fmt,
+            layer=child,
+            layers=layers,
+            description_len=description_len,
+            level=level + 1,
+            color=color,
+        )
+
+
+#
+# A wrapper around subprocess.check_output() with debug output.
+#
+def check_output(
+    *,
+    cmd: list[str],
+    dry_run: bool = False,
+) -> str:
+    print(COLOR_DARK_GRAY + cmd_to_debug_prompt(cmd) + COLOR_END)
+    if dry_run:
+        print("<the actual execution is skipped due to debug mode>")
+        return ""
+    return subprocess.check_output(cmd, encoding="utf-8")
+
+
+#
+# Converts a command to a debug string like:
+# - "$ some command"
+# - "% some command" (when the tool is run as root)
+#
+def cmd_to_debug_prompt(
+    cmd: list[str],
+) -> str:
+    str = shlex.join(cmd)
+    str = re.sub(r" '(--[^=]+=)", r" \1'", str)
+    prompt = "%" if os.geteuid() == 0 else "$"
+    return f"{prompt} {str}"
+
+
+#
+# Represents one cache layer.
+#
+@dataclasses.dataclass
+class Layer:
+    id: str = ""
+    parent: str = ""
+    size: str = ""
+    last_used: str = ""
+    created_at: str = ""
+    usage_count: int = 0
+    description: str = ""
+    is_leaf: bool = True
+    is_root: bool = True
+
+
+#
+# Represents the output of "docker buildx du" or "prune" commands.
+#
+@dataclasses.dataclass
+class Forest:
+    layers: OrderedDict[str, Layer]
+    total: str
+
+
+#
+# A helper class for ArgumentParser.
+#
+class ParagraphFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    def _fill_text(self, text: str, width: int, indent: str) -> str:
+        text = re.sub(r"^ *\n", "", text)
+        return "\n\n".join(
+            [
+                textwrap.indent(textwrap.fill(paragraph, width), indent)
+                for paragraph in textwrap.dedent(text).split("\n\n")
+            ]
+        )
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(
+            f'Command "{shlex.join(e.cmd)}" returned status {e.returncode}.'
+            + (f"\n{e.stdout}" if e.stdout else "")
+            + (f"\n{e.stderr}" if e.stderr else ""),
+            file=sys.stderr,
+        )
+        sys.exit(2)
