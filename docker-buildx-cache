@@ -12,7 +12,19 @@ import textwrap
 import time
 from collections import OrderedDict
 
-HEADER = ["USAGES", "", "ID", "", "PARENT", "SIZE", "LAST USED", "DESCRIPTION", ""]
+HEADER = [
+    "USAGES",
+    "",
+    "",
+    "ID",
+    "",
+    "",
+    "PARENT",
+    "SIZE",
+    "LAST USED",
+    "DESCRIPTION",
+    "",
+]
 COLOR_WHITE = "\033[1;37m"
 COLOR_DARK_GRAY = "\033[38;2;160;160;160m"
 COLOR_END = "\033[0m"
@@ -35,12 +47,13 @@ DATE_FORMATS = [
 def main():
     parser = argparse.ArgumentParser(
         description="""
-            When "du" action is run, calls "docker builds du --verbose" under
-            the hood and represents its output in a "forest" form. Cache layers
-            are displayed with corresponding nesting. Colors are used to
-            highlight layers with common parents.
+            When "du" action is run, the tool calls "docker builds du --verbose"
+            under the hood and represents its output in a "forest" form. Cache
+            layers are displayed with corresponding nesting (each layer may have
+            multiple parents, so they form a DAG). Colors are used to highlight
+            layers with common parents (or same layer ids in the DAG).
 
-            When "prune" action is run, calls "docker buildx prune", then
+            When "prune" action is run, calls "docker buildx prune", the tool
             analyzes its output, the output of du, and additionally calls
             "docker buildx prune" again to prune even more layers. If --verbose
             is used, prints "before" and "after" forests. This action exists to
@@ -302,7 +315,7 @@ def parse_output(
         elif key == "id":
             layer.id = value
         elif key == "parent":
-            layer.parent = value
+            layer.parents = value.split(",")
         elif key == "size":
             layer.size = value
         elif key == "last used":
@@ -317,10 +330,10 @@ def parse_output(
     layers = OrderedDict(sorted(layers.items(), key=lambda item: item[1].created_at))
 
     for layer in layers.values():
-        if layer.parent in layers:
-            layer.is_root = False
-        if layer.parent in layers:
-            layers[layer.parent].is_leaf = False
+        for parent in layer.parents:
+            if parent in layers:
+                layer.is_root = False
+                layers[parent].is_leaf = False
 
     return Forest(layers=layers, total=total)
 
@@ -330,20 +343,25 @@ def parse_output(
 #
 def build_extra_prunable_ids(*, forest: Forest, ids_pruned: list[str]) -> list[str]:
     # Initially, all layers are non-prunable.
-    prunable_ids = OrderedDict[str, None]()
+    prunable_ids = OrderedDict[str, True]()
     # Mark chain to root as prunable for chains which include ids_pruned.
-    for id in ids_pruned:
-        while id in forest.layers:
-            prunable_ids[id] = None
-            id = forest.layers[id].parent
+    ids_queue = [*ids_pruned]
+    while ids_queue:
+        id = ids_queue.pop(0)
+        if id in forest.layers:
+            prunable_ids[id] = True
+            ids_queue.extend(forest.layers[id].parents)
     # Mark chains to root starting from each leaf as non-prunable if that leaf
     # is not in ids_pruned.
     for leaf in (leaf for leaf in forest.layers.values() if leaf.is_leaf):
         if not leaf.id in ids_pruned:
-            id = leaf.id
-            while id in forest.layers:
-                prunable_ids.pop(id, None)
-                id = forest.layers[id].parent
+            ids_queue = [leaf.id]
+            while ids_queue:
+                id = ids_queue.pop(0)
+                if id in forest.layers:
+                    prunable_ids.pop(id, None)
+                    ids_queue.extend(forest.layers[id].parents)
+
     # Remove originally pruned ids too.
     for id in ids_pruned:
         prunable_ids.pop(id, None)
@@ -360,14 +378,20 @@ def print_forest(
     only_total: bool,
     total_msg: str = "TOTAL",
 ) -> None:
-    fmt = "{:<8} {}{:<30} {}{:<30} {:<12} {:<26} {:<" + str(description_len) + "}{}"
+    fmt = "{:<8} {}{}{:<30}{} {}{:<30} {:<12} {:<26} {:<" + str(description_len) + "}{}"
     if not only_total:
+        for layer in forest.layers.values():
+            if len(layer.parents) > 1:
+                color = COLORS.pop(0)
+                COLORS.append(color)
+                layer.id_color = color
         roots = [layer for layer in forest.layers.values() if layer.is_root]
         if roots:
             print(COLOR_WHITE + fmt.format(*HEADER) + COLOR_END)
             for layer in roots:
                 print_with_children(
                     fmt=fmt,
+                    parent=None,
                     layer=layer,
                     description_len=description_len,
                     layers=forest.layers,
@@ -383,6 +407,7 @@ def print_forest(
 def print_with_children(
     *,
     fmt: str,
+    parent: str | None,
     layer: Layer,
     description_len: int,
     layers: OrderedDict[str, Layer],
@@ -395,22 +420,26 @@ def print_with_children(
     description = re.sub(r"true && ", "", description)
     if len(description) > description_len:
         description = description[:description_len] + "..."
-    c_start = color
-    c_end = COLOR_END if color else ""
     print(
         fmt.format(
             f"  {layer.usage_count}",
             "  " * level,
+            layer.id_color,
             layer.id,
-            c_start,
-            layer.parent or "—",
+            COLOR_END if layer.id_color else "",
+            color,
+            (
+                parent
+                if parent in layer.parents
+                else layer.parents[0] if layer.parents else "—"
+            ),
             layer.size or "",
             layer.last_used or "",
             description,
-            c_end,
+            COLOR_END if color else "",
         )
     )
-    children = [child for child in layers.values() if child.parent == layer.id]
+    children = [child for child in layers.values() if layer.id in child.parents]
     if len(children) > 1:
         color = COLORS.pop(0)
         COLORS.append(color)
@@ -419,6 +448,7 @@ def print_with_children(
     for child in children:
         print_with_children(
             fmt=fmt,
+            parent=layer.id,
             layer=child,
             layers=layers,
             description_len=description_len,
@@ -462,7 +492,8 @@ def cmd_to_debug_prompt(
 @dataclasses.dataclass
 class Layer:
     id: str = ""
-    parent: str = ""
+    id_color: str = ""
+    parents: list[str] = dataclasses.field(default_factory=list)
     size: str = ""
     last_used: str = ""
     created_at: str = ""
